@@ -13,6 +13,7 @@ import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
+import io.flutter.plugin.common.StandardMethodCodec;
 import io.flutter.plugin.common.BinaryMessenger;
 
 public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.StreamHandler {
@@ -34,7 +35,14 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
         m_SerialDevice = serialDevice;
         m_MethodChannelName = "usb_serial/UsbSerialPortAdapter/" + String.valueOf(interfaceId);
         m_handler = new Handler(Looper.getMainLooper());
-        final MethodChannel channel = new MethodChannel(m_Messenger, m_MethodChannelName);
+        // Run the per-port method-call handler (including write) OFF the main
+        // thread on a background SERIAL task queue, so a `write` no longer queues
+        // behind the continuous read-event Runnables that this adapter posts to
+        // the main thread (m_handler.post in onReceivedData). Serial => the open/
+        // setDTR/setRTS/setPortParameters/write ordering is preserved.
+        final BinaryMessenger.TaskQueue taskQueue = m_Messenger.makeBackgroundTaskQueue();
+        final MethodChannel channel = new MethodChannel(
+                m_Messenger, m_MethodChannelName, StandardMethodCodec.INSTANCE, taskQueue);
         channel.setMethodCallHandler(this);
         final EventChannel eventChannel = new EventChannel(m_Messenger, m_MethodChannelName + "/stream");
         eventChannel.setStreamHandler(this);
