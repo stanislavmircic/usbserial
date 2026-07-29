@@ -5,6 +5,8 @@ import android.util.Log;
 import android.os.Handler;
 import android.os.Looper;
 
+import java.io.ByteArrayOutputStream;
+
 import com.felhr.usbserial.UsbSerialDevice;
 import com.felhr.usbserial.UsbSerialInterface;
 
@@ -26,6 +28,37 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
     private String m_MethodChannelName;
     private EventChannel.EventSink m_EventSink;
     private Handler m_handler;
+
+    // Read batching. felhr delivers one onReceivedData callback per USB bulk
+    // packet (tens of bytes, ~1000/second for a streaming SpikerBox). Sending
+    // one EventChannel event per packet floods the Flutter main thread, so the
+    // app cannot drain the driver buffer fast enough and the live signal lags.
+    // Instead we accumulate the incoming bytes on felhr's read thread and flush
+    // them to Dart in one merged event on a fixed 5 ms timer on the main thread:
+    // ~200 events/second of ~100 bytes each at 20 kB/s, at most 5 ms of added
+    // delay, byte order preserved.
+    private static final int FLUSH_INTERVAL_MS = 5;
+    private final Object m_readLock = new Object();
+    private final ByteArrayOutputStream m_readBuffer = new ByteArrayOutputStream();
+    private volatile boolean m_reading = false;
+    private final Runnable m_flushRunnable = new Runnable() {
+        @Override
+        public void run() {
+            byte[] out = null;
+            synchronized (m_readLock) {
+                if (m_readBuffer.size() > 0) {
+                    out = m_readBuffer.toByteArray();
+                    m_readBuffer.reset();
+                }
+            }
+            if (out != null && m_EventSink != null) {
+                m_EventSink.success(out);
+            }
+            if (m_reading) {
+                m_handler.postDelayed(this, FLUSH_INTERVAL_MS);
+            }
+        }
+    };
 
     UsbSerialPortAdapter(BinaryMessenger messenger, int interfaceId, UsbDeviceConnection connection, UsbSerialDevice serialDevice) {
         m_Messenger = messenger;
@@ -60,15 +93,12 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
         @Override
         public void onReceivedData(byte[] arg0)
         {
-            if ( m_EventSink != null ) {
-                m_handler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if ( m_EventSink != null ) {
-                            m_EventSink.success(arg0);
-                        }
-                    }
-                });
+            // Called on felhr's read thread. Append to the shared buffer; the
+            // 5 ms timer on the main thread flushes it to Dart in one event.
+            if ( arg0 != null && arg0.length > 0 ) {
+                synchronized (m_readLock) {
+                    m_readBuffer.write(arg0, 0, arg0.length);
+                }
             }
         }
 
@@ -76,7 +106,12 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
 
     private Boolean open() {
         if ( m_SerialDevice.open() ) {
+            synchronized (m_readLock) {
+                m_readBuffer.reset();
+            }
+            m_reading = true;
             m_SerialDevice.read(mCallback);
+            m_handler.postDelayed(m_flushRunnable, FLUSH_INTERVAL_MS);
             return true;
         } else {
             return false;
@@ -84,6 +119,19 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
     }
 
     private Boolean close() {
+        m_reading = false;
+        m_handler.removeCallbacks(m_flushRunnable);
+        // Flush whatever is still buffered so no bytes are lost on close.
+        byte[] out = null;
+        synchronized (m_readLock) {
+            if (m_readBuffer.size() > 0) {
+                out = m_readBuffer.toByteArray();
+                m_readBuffer.reset();
+            }
+        }
+        if (out != null && m_EventSink != null) {
+            m_EventSink.success(out);
+        }
         m_SerialDevice.close();
         return true;
     }
@@ -149,6 +197,8 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
 
     @Override
     public void onCancel(Object o) {
+        m_reading = false;
+        m_handler.removeCallbacks(m_flushRunnable);
         m_EventSink = null;
 
     }
