@@ -38,19 +38,47 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
     // drawing, so the driver buffer backed up and the live signal lagged.
     //
     // Instead we open the device in synchronous mode and run one dedicated read
-    // thread that asks the USB for a large (16 KB) buffer and takes whatever is
-    // there — 20 bytes or 5000, however much has accumulated. It gathers the
-    // bytes and hands one large, variable-size piece up to Dart once it has a
+    // thread that asks the USB for the next packet and takes whatever is there —
+    // 20 bytes or 62, however much the chip had ready. It gathers the bytes and
+    // hands one large, variable-size piece up to Dart once it has a
     // real chunk (>= FLUSH_THRESHOLD_BYTES) or when the stream pauses. The read
     // loop is paced by data availability, not by a clock, so nothing depends on
     // a timer firing on time, and no fixed small packet size is imposed. Byte
     // order is preserved. Write uses the matching synchronous call on the main
     // thread (unchanged connect behaviour). The control calls (DTR/RTS/baud/
     // parity) are the same USB control messages in either mode.
-    private static final int READ_BUFFER_SIZE = 16384;   // Android bulkTransfer caps a single read at 16 KB.
+    //
+    // THE MOST A SINGLE ANDROID READ MAY ASK FOR: ONE USB PACKET.
+    //
+    // A USB bulk read of N bytes finishes when N bytes have arrived, when a packet
+    // SHORTER than the endpoint's packet size arrives, or on timeout — and when it
+    // times out the kernel throws away the bytes it already had and returns -1.
+    // A streaming FTDI chip sends only FULL packets (it waits until it holds 62
+    // bytes, far sooner than its 16 ms idle timer), so a multi-packet read on a
+    // streaming board NEVER finishes early and ALWAYS times out: a 16 KB read at
+    // the Human-Human Interface's 20000 bytes/second needs about 820 ms against a
+    // 100 ms timeout, so every byte of that board was discarded and the log showed
+    // zero at 500000 (T-305). One packet is the only size that is always reached.
+    //
+    // Both chips we read have a 64-byte bulk packet. felhr's FTDI read reserves two
+    // status bytes for every 62 asked for, so 62 asks the wire for exactly 64; every
+    // other driver passes the number through, so 64 asks for exactly 64.
+    private static final int FTDI_READ_BYTES  = 62;
+    private static final int OTHER_READ_BYTES = 64;
     private static final int READ_TIMEOUT_MS = 100;      // block up to this long waiting for data; on idle, flush the tail.
     private static final int FLUSH_THRESHOLD_BYTES = 512; // hand up once this much is gathered (a large, variable piece).
     private static final int WRITE_TIMEOUT_MS = 200;
+
+    // Chosen once, from the driver felhr handed us — never guessed from the
+    // vendor number.
+    private final int m_readRequestBytes;
+
+    // False until setPortParameters has applied the real baud rate. felhr's
+    // openFTDI() ends by programming the chip to 9600
+    // (FTDISerialDevice.java:474), and open() below starts the read thread
+    // straight after syncOpen(), so the first reads of every open happen at
+    // 9600. Those bytes are noise and are dropped on purpose (T-305).
+    private volatile boolean m_rateSet = false;
 
     private volatile boolean m_reading = false;
     private Thread m_readThread;
@@ -60,6 +88,9 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
         m_InterfaceId = interfaceId;
         m_Connection = connection;
         m_SerialDevice = serialDevice;
+        m_readRequestBytes = (serialDevice instanceof com.felhr.usbserial.FTDISerialDevice)
+                ? FTDI_READ_BYTES
+                : OTHER_READ_BYTES;
         m_MethodChannelName = "usb_serial/UsbSerialPortAdapter/" + String.valueOf(interfaceId);
         m_handler = new Handler(Looper.getMainLooper());
         final MethodChannel channel = new MethodChannel(m_Messenger, m_MethodChannelName);
@@ -77,6 +108,9 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
         m_SerialDevice.setDataBits(dataBits);
         m_SerialDevice.setStopBits(stopBits);
         m_SerialDevice.setParity(parity);
+        // From here on the line is running at the rate the caller asked for, so
+        // what the read loop gathers is real data (T-305).
+        m_rateSet = true;
     }
 
     private void setFlowControl( int flowControl ) {
@@ -100,16 +134,25 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
     private final Runnable m_readLoop = new Runnable() {
         @Override
         public void run() {
-            byte[] buffer = new byte[READ_BUFFER_SIZE];
+            byte[] buffer = new byte[m_readRequestBytes];
             ByteArrayOutputStream gathered = new ByteArrayOutputStream();
             while (m_reading) {
                 int n;
                 try {
-                    // Ask for a large buffer; returns however many bytes are
-                    // available now (up to READ_BUFFER_SIZE), or <= 0 on timeout.
+                    // Ask the wire for ONE packet; it is always reached, so this
+                    // read finishes with its bytes instead of timing out and
+                    // having them thrown away. Returns <= 0 only when the line
+                    // really was idle for the whole timeout.
                     n = m_SerialDevice.syncRead(buffer, READ_TIMEOUT_MS);
                 } catch (Exception e) {
                     if (!m_reading) break;
+                    continue;
+                }
+                if (!m_rateSet) {
+                    // Read at the 9600 baud felhr's open leaves behind, before
+                    // setPortParameters applied the real rate. Mis-clocked
+                    // framing noise — never hand it up.
+                    gathered.reset();
                     continue;
                 }
                 if (n > 0) {
