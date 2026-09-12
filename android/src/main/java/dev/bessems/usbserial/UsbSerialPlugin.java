@@ -208,7 +208,12 @@ public class UsbSerialPlugin implements FlutterPlugin, MethodCallHandler, EventC
 
             if (serialDeviceDevice != null) {
                 int interfaceId = m_InterfaceId++;
-                UsbSerialPortAdapter adapter = new UsbSerialPortAdapter(m_Messenger, interfaceId, connection, serialDeviceDevice);
+                // The UsbDevice and the interface index go along so the adapter
+                // can ASK THE BULK IN ENDPOINT its maximum packet size, which
+                // is the size a single read may ask for. felhr keeps its own
+                // endpoint private, and the packet size must not be guessed
+                // from the vendor number (T-305).
+                UsbSerialPortAdapter adapter = new UsbSerialPortAdapter(m_Messenger, interfaceId, connection, serialDeviceDevice, device, iface);
                 result.success(adapter.getMethodChannelName());
                 Log.d(TAG, "success.");
                 return;

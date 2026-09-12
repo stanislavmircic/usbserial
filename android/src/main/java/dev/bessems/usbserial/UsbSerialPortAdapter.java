@@ -1,13 +1,15 @@
 package dev.bessems.usbserial;
 
+import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
 import android.util.Log;
 import android.os.Handler;
 import android.os.Looper;
 
-import java.io.ByteArrayOutputStream;
-import java.util.Arrays;
-
+import com.felhr.usbserial.FTDISerialDevice;
 import com.felhr.usbserial.UsbSerialDevice;
 import com.felhr.usbserial.UsbSerialInterface;
 
@@ -30,73 +32,166 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
     private volatile EventChannel.EventSink m_EventSink;
     private Handler m_handler;
 
-    // Large-buffer read loop (replaces felhr's per-packet async callback).
+    // ONE USB PACKET PER READ, INTO A CIRCULAR BUFFER, DRAINED ON A SLOW CLOCK.
     //
-    // The old async read delivered one EventChannel event per USB bulk packet
-    // (~1000/second of ~15 bytes for a streaming SpikerBox) on the main thread.
-    // The Flutter main thread cannot service ~1000 hand-offs/second while also
-    // drawing, so the driver buffer backed up and the live signal lagged.
+    // Three parts, and each one exists because the two shapes that came before
+    // it were each half right:
     //
-    // Instead we open the device in synchronous mode and run one dedicated read
-    // thread that asks the USB for the next packet and takes whatever is there —
-    // 20 bytes or 62, however much the chip had ready. It gathers the bytes and
-    // hands one large, variable-size piece up to Dart once it has a
-    // real chunk (>= FLUSH_THRESHOLD_BYTES) or when the stream pauses. The read
-    // loop is paced by data availability, not by a clock, so nothing depends on
-    // a timer firing on time, and no fixed small packet size is imposed. Byte
-    // order is preserved. Write uses the matching synchronous call on the main
-    // thread (unchanged connect behaviour). The control calls (DTR/RTS/baud/
-    // parity) are the same USB control messages in either mode.
+    //  * felhr's asynchronous read never lost a byte, but it posted one
+    //    EventChannel message per USB packet — about 1000 a second, about 15
+    //    bytes each — onto the Flutter main thread, which cannot service that
+    //    and draw at the same time.
+    //  * The synchronous read that replaced it (this fork's 6b2b5d0) fixed the
+    //    message rate by asking a single read for 16384 bytes, and started
+    //    losing every byte instead. A USB bulk read finishes when it has all the
+    //    bytes it asked for, when a packet SHORTER than the endpoint's packet
+    //    size arrives, or on its timeout — and a timed-out bulk read does NOT
+    //    give back the bytes it already held: the kernel drops them and
+    //    bulkTransfer answers -1. A board that streams steadily never sends a
+    //    short packet (an FTDI chip sends as soon as it holds one packet's worth
+    //    of data, far sooner than its 16 ms idle timer), so on such a board a
+    //    16 KB read could only ever end on its timeout. At the Human-Human
+    //    Interface's 20000 bytes a second, filling 16384 bytes needs about
+    //    820 ms against a 100 ms timeout: every read destroyed a tenth of a
+    //    second of the stream and delivered nothing, so that board reported
+    //    0 bytes at 500000 — the one rate at which it answers.
     //
-    // THE MOST A SINGLE ANDROID READ MAY ASK FOR: ONE USB PACKET.
+    // 1. THE READER ASKS FOR ONE PACKET PER READ. One packet is the only size
+    //    that is always reached, so the read returns with data every time and
+    //    the timeout is never the thing that ends it. The size is asked of the
+    //    ENDPOINT (see bulkInPacketBytes below), not assumed.
+    // 2. IT STORES THE BYTES IN A 1 MB CIRCULAR BUFFER AND DOES NOTHING ELSE —
+    //    no allocation per read, no delivery, no decisions. UsbReadRing carries
+    //    the size arithmetic (five seconds at the fastest board) and the
+    //    decision about what happens when it fills.
+    // 3. A DRAIN RUNS 20 TIMES A SECOND AND TAKES WHATEVER IS THERE. It reads
+    //    the write head, copies everything between the tail and that head,
+    //    advances the tail, and hands one piece up. Never a fixed size: the
+    //    piece is about 8.8 KB at the fastest board and about 1 KB at the
+    //    slowest, always more than one packet, and it varies with what arrived.
     //
-    // A USB bulk read of N bytes finishes when N bytes have arrived, when a packet
-    // SHORTER than the endpoint's packet size arrives, or on timeout — and when it
-    // times out the kernel throws away the bytes it already had and returns -1.
-    // A streaming FTDI chip sends only FULL packets (it waits until it holds 62
-    // bytes, far sooner than its 16 ms idle timer), so a multi-packet read on a
-    // streaming board NEVER finishes early and ALWAYS times out: a 16 KB read at
-    // the Human-Human Interface's 20000 bytes/second needs about 820 ms against a
-    // 100 ms timeout, so every byte of that board was discarded and the log showed
-    // zero at 500000 (T-305). One packet is the only size that is always reached.
-    //
-    // Both chips we read have a 64-byte bulk packet. felhr's FTDI read reserves two
-    // status bytes for every 62 asked for, so 62 asks the wire for exactly 64; every
-    // other driver passes the number through, so 64 asks for exactly 64.
-    private static final int FTDI_READ_BYTES  = 62;
-    private static final int OTHER_READ_BYTES = 64;
-    private static final int READ_TIMEOUT_MS = 100;      // block up to this long waiting for data; on idle, flush the tail.
-    private static final int FLUSH_THRESHOLD_BYTES = 512; // hand up once this much is gathered (a large, variable piece).
+    // The promise to Dart is the one it always had — one large, variable-size
+    // piece, in order, with nothing dropped, and the tail never held back by
+    // more than one drain period. The mechanism that keeps it is new; the
+    // promise is not. Byte order is preserved exactly. The write path, and the
+    // control calls for baud, parity, DTR and RTS, are untouched.
+    private static final int READ_TIMEOUT_MS = 100;   // only reached when the line really is idle
     private static final int WRITE_TIMEOUT_MS = 200;
 
-    // Chosen once, from the driver felhr handed us — never guessed from the
-    // vendor number.
+    // 20 times a second. Slow enough that the main thread gets 20 messages a
+    // second instead of 1000, fast enough that the tail of the stream is never
+    // held back longer than this — well inside the 1200 ms the application
+    // allows a board to answer its identify request.
+    private static final int DRAIN_INTERVAL_MS = 50;
+
+    // What felhr's FTDI read adds on top of what it is asked for: two status
+    // bytes at the head of every 62 data bytes. FTDISerialDevice.syncRead
+    // allocates buffer.length + ceil(buffer.length / 62) * 2 and hands THAT to
+    // bulkTransfer (felhr 6.1.0, FTDISerialDevice.java:636-689), so to put
+    // exactly one packet on the wire we must ask it for (packet - 2). Every
+    // other driver passes the number straight through
+    // (UsbSerialDevice.java:205-217), so we ask those for the packet size
+    // itself.
+    private static final int FTDI_STATUS_BYTES_PER_PACKET = 2;
+
+    // Used only when the endpoint cannot be inspected at all (a null UsbDevice,
+    // or a device that declares no bulk IN endpoint). 64 bytes is the maximum a
+    // full-speed USB bulk endpoint may declare, so it can never be larger than
+    // the real packet, and it is what both chips this application reads — the
+    // FTDI FT230X/FT231X and the native-USB (CDC) boards — actually report.
+    private static final int FALLBACK_PACKET_BYTES = 64;
+
+    // The real maximum packet size of the bulk IN endpoint, read from the
+    // endpoint itself, and what a single syncRead is asked for. Both are
+    // decided once, in the constructor, and never change.
+    private final int m_packetBytes;
     private final int m_readRequestBytes;
 
-    // False until setPortParameters has applied the real baud rate. felhr's
-    // openFTDI() ends by programming the chip to 9600
+    // Everything the reader stores and the drain takes.
+    private final UsbReadRing m_ring = new UsbReadRing();
+
+    // False until setPortParameters has applied the real baud rate.
+    //
+    // felhr's openFTDI() ends by programming the chip to 9600 baud
     // (FTDISerialDevice.java:474), and open() below starts the read thread
-    // straight after syncOpen(), so the first reads of every open happen at
-    // 9600. Those bytes are noise and are dropped on purpose (T-305).
+    // straight after syncOpen(), so the first reads of every open are made at
+    // 9600 no matter what rate the caller wants. Those bytes are mis-clocked
+    // framing noise. THE READER STILL READS THEM — leaving them in the USB pipe
+    // would fill the chip's own small buffer and stall the board — but it does
+    // not store them, so they never enter the circular buffer and no part
+    // downstream has to know about them. The reader is the only writer, so
+    // there is nothing to clear afterwards either.
     private volatile boolean m_rateSet = false;
 
     private volatile boolean m_reading = false;
     private Thread m_readThread;
+    private Thread m_drainThread;
 
     UsbSerialPortAdapter(BinaryMessenger messenger, int interfaceId, UsbDeviceConnection connection, UsbSerialDevice serialDevice) {
+        this(messenger, interfaceId, connection, serialDevice, null, -1);
+    }
+
+    UsbSerialPortAdapter(BinaryMessenger messenger, int interfaceId, UsbDeviceConnection connection, UsbSerialDevice serialDevice, UsbDevice device, int iface) {
         m_Messenger = messenger;
         m_InterfaceId = interfaceId;
         m_Connection = connection;
         m_SerialDevice = serialDevice;
-        m_readRequestBytes = (serialDevice instanceof com.felhr.usbserial.FTDISerialDevice)
-                ? FTDI_READ_BYTES
-                : OTHER_READ_BYTES;
+        m_packetBytes = bulkInPacketBytes(device, iface);
+        m_readRequestBytes = (serialDevice instanceof FTDISerialDevice)
+                ? m_packetBytes - FTDI_STATUS_BYTES_PER_PACKET
+                : m_packetBytes;
+        Log.i(TAG, "bulk IN endpoint packet size " + m_packetBytes
+                + " bytes; one read asks for " + m_readRequestBytes
+                + " bytes (" + serialDevice.getClass().getSimpleName() + ")");
         m_MethodChannelName = "usb_serial/UsbSerialPortAdapter/" + String.valueOf(interfaceId);
         m_handler = new Handler(Looper.getMainLooper());
         final MethodChannel channel = new MethodChannel(m_Messenger, m_MethodChannelName);
         channel.setMethodCallHandler(this);
         final EventChannel eventChannel = new EventChannel(m_Messenger, m_MethodChannelName + "/stream");
         eventChannel.setStreamHandler(this);
+    }
+
+    // ASK THE ENDPOINT ITS PACKET SIZE — never guess it from the vendor number.
+    //
+    // felhr claims one interface and then takes the first bulk IN endpoint on
+    // it: the interface is the one the caller named when it named one, and
+    // otherwise interface 0 for an FTDI chip (FTDISerialDevice.java:117) or the
+    // first interface that carries serial data for a CDC device
+    // (CDCSerialDevice.java:65). We look in the same place, and when the caller
+    // named no interface we take the first bulk IN endpoint in interface order —
+    // which for both of those rules is the same endpoint felhr ends up reading.
+    //
+    // A full-speed bulk endpoint may declare 8, 16, 32 or 64 bytes and a
+    // high-speed one 512; whatever it declares is the size that always satisfies
+    // a read, which is the whole point. Both chips this application reads report
+    // 64.
+    private static int bulkInPacketBytes(UsbDevice device, int iface) {
+        if (device == null) {
+            return FALLBACK_PACKET_BYTES;
+        }
+        final int count = device.getInterfaceCount();
+        final int first = (iface >= 0) ? iface : 0;
+        final int last = (iface >= 0) ? iface : count - 1;
+        for (int i = first; i <= last && i < count; i++) {
+            final UsbInterface ui = device.getInterface(i);
+            if (ui == null) {
+                continue;
+            }
+            for (int e = 0; e < ui.getEndpointCount(); e++) {
+                final UsbEndpoint endpoint = ui.getEndpoint(e);
+                if (endpoint == null) {
+                    continue;
+                }
+                if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK
+                        && endpoint.getDirection() == UsbConstants.USB_DIR_IN) {
+                    final int size = endpoint.getMaxPacketSize();
+                    if (size > 0) {
+                        return size;
+                    }
+                }
+            }
+        }
+        return FALLBACK_PACKET_BYTES;
     }
 
     String getMethodChannelName() {
@@ -108,8 +203,8 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
         m_SerialDevice.setDataBits(dataBits);
         m_SerialDevice.setStopBits(stopBits);
         m_SerialDevice.setParity(parity);
-        // From here on the line is running at the rate the caller asked for, so
-        // what the read loop gathers is real data (T-305).
+        // From here on the line runs at the rate the caller asked for, so what
+        // the reader stores is real data.
         m_rateSet = true;
     }
 
@@ -117,8 +212,10 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
         m_SerialDevice.setFlowControl(flowControl);
     }
 
-    // Send one gathered piece up to Dart on the main thread (EventChannel
-    // requires the sink to be called on the platform main thread).
+    // Send one drained piece up to Dart on the main thread (EventChannel
+    // requires the sink to be called on the platform main thread). This is the
+    // ONLY main-thread work the read road does, and it happens 20 times a
+    // second.
     private void deliver(final byte[] data) {
         m_handler.post(new Runnable() {
             @Override
@@ -131,61 +228,77 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
         });
     }
 
+    // THE READER. Read one packet, store it, repeat. Nothing else.
     private final Runnable m_readLoop = new Runnable() {
         @Override
         public void run() {
-            byte[] buffer = new byte[m_readRequestBytes];
-            ByteArrayOutputStream gathered = new ByteArrayOutputStream();
+            final byte[] packet = new byte[m_readRequestBytes];
             while (m_reading) {
                 int n;
                 try {
-                    // Ask the wire for ONE packet; it is always reached, so this
-                    // read finishes with its bytes instead of timing out and
-                    // having them thrown away. Returns <= 0 only when the line
-                    // really was idle for the whole timeout.
-                    n = m_SerialDevice.syncRead(buffer, READ_TIMEOUT_MS);
+                    // Ask the wire for ONE packet. It is always reached, so this
+                    // read comes back with its bytes instead of timing out and
+                    // having them thrown away. It returns <= 0 only when the
+                    // line really was idle for the whole timeout.
+                    n = m_SerialDevice.syncRead(packet, READ_TIMEOUT_MS);
                 } catch (Exception e) {
                     if (!m_reading) break;
                     continue;
                 }
-                if (!m_rateSet) {
-                    // Read at the 9600 baud felhr's open leaves behind, before
-                    // setPortParameters applied the real rate. Mis-clocked
-                    // framing noise — never hand it up.
-                    gathered.reset();
+                if (n <= 0) {
                     continue;
                 }
-                if (n > 0) {
-                    gathered.write(buffer, 0, n);
-                    // Hand up a large piece once we have gathered a real chunk.
-                    // Only deliver once a listener exists, otherwise keep
-                    // gathering so no early bytes (e.g. the identify reply) are
-                    // lost before Dart subscribes.
-                    if (gathered.size() >= FLUSH_THRESHOLD_BYTES && m_EventSink != null) {
-                        deliver(gathered.toByteArray());
-                        gathered.reset();
-                    }
-                } else {
-                    // Timeout with no data = a gap in the stream. Flush whatever
-                    // we have so the tail is not held back.
-                    if (gathered.size() > 0 && m_EventSink != null) {
-                        deliver(gathered.toByteArray());
-                        gathered.reset();
-                    }
+                if (!m_rateSet) {
+                    // Read at the 9600 baud felhr's open leaves behind, before
+                    // setPortParameters applied the real rate. Read so the USB
+                    // pipe stays clear, then thrown away: mis-clocked noise
+                    // never enters the circular buffer.
+                    continue;
                 }
-            }
-            // Final flush on stop so no gathered bytes are lost.
-            if (gathered.size() > 0 && m_EventSink != null) {
-                deliver(gathered.toByteArray());
+                m_ring.write(packet, n);
             }
         }
     };
+
+    // THE DRAIN. Once every DRAIN_INTERVAL_MS, take whatever is there.
+    private final Runnable m_drainLoop = new Runnable() {
+        @Override
+        public void run() {
+            while (m_reading) {
+                try {
+                    Thread.sleep(DRAIN_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    break;
+                }
+                handOff();
+            }
+            // One last turn after the reader has stopped, so the tail of the
+            // stream is not left behind.
+            handOff();
+        }
+    };
+
+    // Take one piece and hand it up. Nothing is taken while Dart is not
+    // listening yet: the circular buffer holds the bytes instead, so the
+    // board's answer to an identify request written before the listener is
+    // attached is still there when it arrives.
+    private void handOff() {
+        if (m_EventSink == null) {
+            return;
+        }
+        final byte[] piece = m_ring.drain();
+        if (piece != null && piece.length > 0) {
+            deliver(piece);
+        }
+    }
 
     private Boolean open() {
         if ( m_SerialDevice.syncOpen() ) {
             m_reading = true;
             m_readThread = new Thread(m_readLoop, "usb_serial-read-" + m_InterfaceId);
             m_readThread.start();
+            m_drainThread = new Thread(m_drainLoop, "usb_serial-drain-" + m_InterfaceId);
+            m_drainThread.start();
             return true;
         } else {
             return false;
@@ -194,15 +307,30 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
 
     private Boolean close() {
         m_reading = false;
-        Thread t = m_readThread;
+        Thread reader = m_readThread;
         m_readThread = null;
-        if (t != null) {
+        if (reader != null) {
             try {
-                t.join(READ_TIMEOUT_MS + 100);
+                reader.join(READ_TIMEOUT_MS + 100);
             } catch (InterruptedException e) {
                 // ignore
             }
         }
+        Thread drain = m_drainThread;
+        m_drainThread = null;
+        if (drain != null) {
+            drain.interrupt();
+            try {
+                drain.join(DRAIN_INTERVAL_MS + 100);
+            } catch (InterruptedException e) {
+                // ignore
+            }
+        }
+        // Whatever the reader stored after the drain's last turn.
+        handOff();
+        Log.i(TAG, "read road closed: " + m_ring.writtenBytes() + " bytes stored, "
+                + m_ring.drainedBytes() + " handed up in " + m_ring.pieces()
+                + " pieces, " + m_ring.overrunBytes() + " lost to a late drain");
         m_SerialDevice.syncClose();
         return true;
     }

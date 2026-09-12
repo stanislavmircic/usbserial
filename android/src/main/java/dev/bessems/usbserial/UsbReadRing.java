@@ -1,0 +1,218 @@
+package dev.bessems.usbserial;
+
+/**
+ * A circular byte buffer between the USB read thread and the thread that hands
+ * bytes up to Dart. ONE writer, ONE reader, no lock on either side.
+ *
+ * <p>WHY IT EXISTS. Two shapes of the Android read came before this one and
+ * each was half right:
+ *
+ * <ul>
+ *   <li>felhr's asynchronous read never lost a byte, but it posted one
+ *       EventChannel message per USB packet — about 1000 a second, of about 15
+ *       bytes each — onto the Flutter main thread. The main thread cannot
+ *       service that and draw at the same time, so the signal lagged.</li>
+ *   <li>The synchronous read that replaced it (this fork's commit 6b2b5d0)
+ *       fixed the message rate by asking one read for 16384 bytes, and started
+ *       losing every byte instead: a USB bulk read finishes when it has all the
+ *       bytes it asked for, when a packet SHORTER than the endpoint's packet
+ *       size arrives, or on its timeout — and a timed-out bulk read does not
+ *       give back the bytes it already held. The kernel drops them and
+ *       {@code UsbDeviceConnection.bulkTransfer} answers -1. A board that is
+ *       streaming steadily never sends a short packet, so a 16 KB read on such
+ *       a board could only ever end on its timeout. Every read destroyed a
+ *       tenth of a second of the stream and delivered nothing.</li>
+ * </ul>
+ *
+ * <p>This buffer keeps both halves. The reader asks for ONE packet per read, so
+ * the read is always satisfied and the timeout is never reached; it stores the
+ * bytes here and does nothing else. A separate drain runs on its own clock, 20
+ * times a second, and hands up whatever has collected since the last time — one
+ * large, variable-size piece. Neither thread waits for the other.
+ *
+ * <h2>Size: one megabyte, and the arithmetic</h2>
+ *
+ * Stanislav's ruling, 2026-09-12: <i>"you dont need 23 seconds of buffer it can
+ * be max 5 sec"</i>. Five seconds at the fastest board the application
+ * supports:
+ *
+ * <pre>
+ *   44100 samples/second x 2 channels x 2 bytes/sample = 176400 bytes/second
+ *   176400 bytes/second x 5 seconds                    = 882000 bytes
+ * </pre>
+ *
+ * 1048576 (1 MB) is the next power of two above 882000 bytes, which is 5.94
+ * seconds at that rate. A power of two lets an index wrap with a bit mask
+ * instead of a division. At the board that made this fault visible — the
+ * Human-Human Interface, 10000 Hz x 1 channel x 2 bytes = 20000 bytes a second
+ * — the same buffer holds 52 seconds.
+ *
+ * <h2>When the drain is late and the buffer fills: THE OLDEST BYTES GO</h2>
+ *
+ * The reader never blocks and never refuses to store. When it catches up with
+ * the tail it writes straight over the oldest bytes, and the drain notices on
+ * its next turn: it sees more bytes claimed than the buffer can hold, counts
+ * the difference as lost, and moves its tail forward to the oldest byte that is
+ * still intact.
+ *
+ * <p>The choice is deliberate. Dropping the NEWEST bytes instead would mean the
+ * reader stops emptying the USB pipe, so the chip's own small buffer fills, the
+ * board's stream stalls, and the person watches a frozen live trace that plays
+ * out stale data and never catches up. Overwriting the OLDEST keeps the USB pipe
+ * drained and keeps the display showing the present: a person sees one short
+ * break in the trace and then a live signal again. A break is visible and
+ * recoverable; a permanently delayed trace is neither.
+ *
+ * <p>For this to happen at all the drain has to miss its turn about 120 times in
+ * a row (5.94 seconds of room against a 50 ms period) at the fastest board.
+ * {@link #overrunBytes()} counts every byte lost this way so a log can say it
+ * plainly instead of leaving a silent gap.
+ *
+ * <h2>Why neither thread can starve the other</h2>
+ *
+ * The only state the two threads share is {@link #m_written}, a
+ * {@code volatile long} that only the reader ever stores and only the drain ever
+ * loads, and {@link #m_drained}, which only the drain ever touches. There is no
+ * lock, so there is nothing to wait for and nothing to hold.
+ *
+ * <ul>
+ *   <li>The reader cannot starve the drain: it spends nearly all its time
+ *       blocked inside {@code bulkTransfer} waiting for the next packet, which
+ *       releases the processor, and its only other work is one
+ *       {@code System.arraycopy} of at most one packet.</li>
+ *   <li>The drain cannot starve the reader: it sleeps for the whole period
+ *       between turns, copies out of a region the reader is not writing into,
+ *       and takes nothing the reader needs. When the drain is late the reader
+ *       simply keeps filling the remaining room.</li>
+ * </ul>
+ *
+ * <p>The bytes are published by the {@code volatile} store of
+ * {@link #m_written} at the end of {@link #write}: every array write before it
+ * is visible to any thread that loads {@code m_written} afterwards and sees the
+ * new value. {@code m_written += n} is a read-modify-write, which is not atomic
+ * in general, but exactly one thread ever performs it, so it is safe here. The
+ * same holds for {@code m_drained} and {@code m_overrun} on the drain thread.
+ *
+ * <p>Nothing in this class is Android-specific, so it can be compiled and
+ * driven on a plain Java virtual machine. {@code tools/UsbReadRingSelfCheck.java}
+ * does exactly that.
+ */
+final class UsbReadRing {
+
+    /** Five seconds at the fastest board, rounded up to a power of two. */
+    static final int CAPACITY_BYTES = 1 << 20; // 1048576
+
+    private static final int INDEX_MASK = CAPACITY_BYTES - 1;
+
+    private final byte[] m_bytes = new byte[CAPACITY_BYTES];
+
+    /** Total bytes ever stored. Stored ONLY by the reader thread. */
+    private volatile long m_written = 0;
+
+    /** Total bytes ever handed up. Touched ONLY by the drain thread. */
+    private long m_drained = 0;
+
+    /** Total bytes the reader wrote over before the drain reached them. */
+    private volatile long m_overrun = 0;
+
+    /** How many pieces {@link #drain} has handed up. Drain thread only. */
+    private volatile long m_pieces = 0;
+
+    /**
+     * Store the first {@code length} bytes of {@code src}. READER THREAD ONLY.
+     *
+     * <p>Never blocks, never allocates, never refuses. If there is not enough
+     * room the oldest bytes are written over; the drain works out how many were
+     * lost on its next turn.
+     */
+    void write(byte[] src, int length) {
+        if (src == null || length <= 0) {
+            return;
+        }
+        // A single read can never be larger than one USB packet, so this clamp
+        // is a guard and not a code path, but a silent out-of-bounds copy is
+        // worse than a clamp.
+        final int n = Math.min(length, CAPACITY_BYTES);
+        final int start = (int) (m_written & INDEX_MASK);
+        final int toEnd = CAPACITY_BYTES - start;
+        if (n <= toEnd) {
+            System.arraycopy(src, 0, m_bytes, start, n);
+        } else {
+            System.arraycopy(src, 0, m_bytes, start, toEnd);
+            System.arraycopy(src, toEnd, m_bytes, 0, n - toEnd);
+        }
+        m_written += n; // the volatile store publishes every byte copied above
+    }
+
+    /**
+     * Take everything stored since the last turn and hand it back as one piece.
+     * DRAIN THREAD ONLY.
+     *
+     * <p>Returns {@code null} when there is nothing there — never an empty
+     * array, and never a fixed size: the piece is exactly as large as whatever
+     * arrived, which at 20 turns a second is about 8.8 KB at the fastest board
+     * and about 1 KB at the slowest.
+     */
+    byte[] drain() {
+        final long head = m_written; // one snapshot, taken once
+        long tail = m_drained;
+        long available = head - tail;
+        if (available <= 0) {
+            return null;
+        }
+
+        if (available > CAPACITY_BYTES) {
+            // The drain was late enough that the reader wrote over the tail.
+            // Count what went and restart from the oldest byte still intact.
+            m_overrun += available - CAPACITY_BYTES;
+            tail = head - CAPACITY_BYTES;
+            available = CAPACITY_BYTES;
+        }
+
+        final int n = (int) available;
+        final byte[] out = new byte[n];
+        final int start = (int) (tail & INDEX_MASK);
+        final int toEnd = CAPACITY_BYTES - start;
+        if (n <= toEnd) {
+            System.arraycopy(m_bytes, start, out, 0, n);
+        } else {
+            System.arraycopy(m_bytes, start, out, 0, toEnd);
+            System.arraycopy(m_bytes, 0, out, toEnd, n - toEnd);
+        }
+
+        // The reader kept going while we copied. If it got far enough to pass
+        // the tail we started from, the head of `out` was overwritten under us
+        // and the piece is torn. Throw the whole piece away rather than hand up
+        // bytes in the wrong order, count it, and start again from the present.
+        final long headNow = m_written;
+        if (headNow - tail > CAPACITY_BYTES) {
+            m_overrun += headNow - tail;
+            m_drained = headNow;
+            return null;
+        }
+
+        m_drained = tail + n;
+        m_pieces++;
+        return out;
+    }
+
+    /** Total bytes stored by the reader since the port opened. */
+    long writtenBytes() {
+        return m_written;
+    }
+
+    /** Total bytes handed up since the port opened. */
+    long drainedBytes() {
+        return m_drained;
+    }
+
+    /** Total bytes lost because the drain was late and the buffer filled. */
+    long overrunBytes() {
+        return m_overrun;
+    }
+
+    /** How many pieces have been handed up since the port opened. */
+    long pieces() {
+        return m_pieces;
+    }
+}
