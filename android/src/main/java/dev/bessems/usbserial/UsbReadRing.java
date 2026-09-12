@@ -2,7 +2,8 @@ package dev.bessems.usbserial;
 
 /**
  * A circular byte buffer between the USB read thread and the thread that hands
- * bytes up to Dart. ONE writer, ONE reader, no lock on either side.
+ * bytes up to Dart. One writer, one reader, and it behaves like any circular
+ * buffer: when the writer catches the reader it overwrites itself.
  *
  * <p>WHY IT EXISTS. Two shapes of the Android read came before this one and
  * each was half right:
@@ -28,7 +29,7 @@ package dev.bessems.usbserial;
  * the read is always satisfied and the timeout is never reached; it stores the
  * bytes here and does nothing else. A separate drain runs on its own clock, 20
  * times a second, and hands up whatever has collected since the last time — one
- * large, variable-size piece. Neither thread waits for the other.
+ * large, variable-size piece.
  *
  * <h2>Size: one megabyte, and the arithmetic</h2>
  *
@@ -47,55 +48,41 @@ package dev.bessems.usbserial;
  * Human-Human Interface, 10000 Hz x 1 channel x 2 bytes = 20000 bytes a second
  * — the same buffer holds 52 seconds.
  *
- * <h2>When the drain is late and the buffer fills: THE OLDEST BYTES GO</h2>
+ * <h2>When the buffer fills: IT OVERWRITES ITSELF, AND THAT IS ALL</h2>
  *
- * The reader never blocks and never refuses to store. When it catches up with
- * the tail it writes straight over the oldest bytes, and the drain notices on
- * its next turn: it sees more bytes claimed than the buffer can hold, counts
- * the difference as lost, and moves its tail forward to the oldest byte that is
- * still intact.
+ * His ruling, 2026-09-12: <i>"'if the drain is ever late and the buffer fills,'
+ * it can not since it will not read fixed amount but the all that is avilable at
+ * that time. But it will do whatever any circular buffer do. it will overwrite
+ * it self."</i>
  *
- * <p>The choice is deliberate. Dropping the NEWEST bytes instead would mean the
- * reader stops emptying the USB pipe, so the chip's own small buffer fills, the
- * board's stream stalls, and the person watches a frozen live trace that plays
- * out stale data and never catches up. Overwriting the OLDEST keeps the USB pipe
- * drained and keeps the display showing the present: a person sees one short
- * break in the trace and then a live signal again. A break is visible and
- * recoverable; a permanently delayed trace is neither.
+ * <p>So there is no special case here. The drain never takes a fixed amount — it
+ * takes everything available at that moment — so it cannot meaningfully fall
+ * behind. If the writer does catch the reader anyway, the bytes the tail pointed
+ * at no longer exist and the tail starts again at the oldest byte that does.
+ * That is ordinary circular-buffer behaviour: no error, no notice, no dropping
+ * of the newest, nothing clever. {@link #overrunBytes()} counts it for a log
+ * line and changes nothing.
  *
- * <p>For this to happen at all the drain has to miss its turn about 120 times in
- * a row (5.94 seconds of room against a 50 ms period) at the fastest board.
- * {@link #overrunBytes()} counts every byte lost this way so a log can say it
- * plainly instead of leaving a silent gap.
+ * <h2>Every open clears it</h2>
  *
- * <h2>Why neither thread can starve the other</h2>
+ * His ruling, same day: <i>"Any time you open connection at one speed you reset
+ * head and tail (you clear the circular buffer buffer)"</i> — see
+ * {@link #reset()}.
  *
- * The only state the two threads share is {@link #m_written}, a
- * {@code volatile long} that only the reader ever stores and only the drain ever
- * loads, and {@link #m_drained}, which only the drain ever touches. There is no
- * lock, so there is nothing to wait for and nothing to hold.
+ * <h2>The one lock, and why neither thread can hold up the other</h2>
  *
- * <ul>
- *   <li>The reader cannot starve the drain: it spends nearly all its time
- *       blocked inside {@code bulkTransfer} waiting for the next packet, which
- *       releases the processor, and its only other work is one
- *       {@code System.arraycopy} of at most one packet.</li>
- *   <li>The drain cannot starve the reader: it sleeps for the whole period
- *       between turns, copies out of a region the reader is not writing into,
- *       and takes nothing the reader needs. When the drain is late the reader
- *       simply keeps filling the remaining room.</li>
- * </ul>
- *
- * <p>The bytes are published by the {@code volatile} store of
- * {@link #m_written} at the end of {@link #write}: every array write before it
- * is visible to any thread that loads {@code m_written} afterwards and sees the
- * new value. {@code m_written += n} is a read-modify-write, which is not atomic
- * in general, but exactly one thread ever performs it, so it is safe here. The
- * same holds for {@code m_drained} and {@code m_overrun} on the drain thread.
+ * Every method synchronizes on this object, so a reset is safe and a piece can
+ * never be handed up torn. The lock is held only for one
+ * {@code System.arraycopy} and a few integer stores, and NEVER across anything
+ * that blocks: the reader is outside it while it waits in {@code bulkTransfer},
+ * and the drain is outside it while it sleeps between turns. So the longest
+ * either thread can wait for the other is the length of a memory copy — at most
+ * one packet on the writer's side, and about 8.8 KB a turn on the reader's at
+ * the fastest board.
  *
  * <p>Nothing in this class is Android-specific, so it can be compiled and
  * driven on a plain Java virtual machine. {@code tools/UsbReadRingSelfCheck.java}
- * does exactly that.
+ * does exactly that, with two real threads.
  */
 final class UsbReadRing {
 
@@ -106,26 +93,26 @@ final class UsbReadRing {
 
     private final byte[] m_bytes = new byte[CAPACITY_BYTES];
 
-    /** Total bytes ever stored. Stored ONLY by the reader thread. */
-    private volatile long m_written = 0;
+    /** Total bytes stored since the buffer was last cleared — the head. */
+    private long m_written = 0;
 
-    /** Total bytes ever handed up. Touched ONLY by the drain thread. */
+    /** Total bytes handed up since the buffer was last cleared — the tail. */
     private long m_drained = 0;
 
-    /** Total bytes the reader wrote over before the drain reached them. */
-    private volatile long m_overrun = 0;
+    /** Total bytes the writer overwrote before the reader reached them. */
+    private long m_overrun = 0;
 
-    /** How many pieces {@link #drain} has handed up. Drain thread only. */
-    private volatile long m_pieces = 0;
+    /** How many pieces {@link #drain} has handed up. */
+    private long m_pieces = 0;
 
     /**
-     * Store the first {@code length} bytes of {@code src}. READER THREAD ONLY.
+     * Store the first {@code length} bytes of {@code src}. READER SIDE.
      *
-     * <p>Never blocks, never allocates, never refuses. If there is not enough
-     * room the oldest bytes are written over; the drain works out how many were
-     * lost on its next turn.
+     * <p>Never blocks on the USB, never allocates, never refuses. If there is no
+     * room the oldest bytes are written over, which is what a circular buffer
+     * does.
      */
-    void write(byte[] src, int length) {
+    synchronized void write(byte[] src, int length) {
         if (src == null || length <= 0) {
             return;
         }
@@ -141,20 +128,20 @@ final class UsbReadRing {
             System.arraycopy(src, 0, m_bytes, start, toEnd);
             System.arraycopy(src, toEnd, m_bytes, 0, n - toEnd);
         }
-        m_written += n; // the volatile store publishes every byte copied above
+        m_written += n;
     }
 
     /**
      * Take everything stored since the last turn and hand it back as one piece.
-     * DRAIN THREAD ONLY.
+     * DRAIN SIDE.
      *
      * <p>Returns {@code null} when there is nothing there — never an empty
      * array, and never a fixed size: the piece is exactly as large as whatever
      * arrived, which at 20 turns a second is about 8.8 KB at the fastest board
      * and about 1 KB at the slowest.
      */
-    byte[] drain() {
-        final long head = m_written; // one snapshot, taken once
+    synchronized byte[] drain() {
+        final long head = m_written;
         long tail = m_drained;
         long available = head - tail;
         if (available <= 0) {
@@ -162,8 +149,10 @@ final class UsbReadRing {
         }
 
         if (available > CAPACITY_BYTES) {
-            // The drain was late enough that the reader wrote over the tail.
-            // Count what went and restart from the oldest byte still intact.
+            // The writer caught the reader, so the bytes the tail pointed at do
+            // not exist any more and it starts again at the oldest that does.
+            // Ordinary circular-buffer behaviour, nothing else; the count is for
+            // a log line and changes nothing.
             m_overrun += available - CAPACITY_BYTES;
             tail = head - CAPACITY_BYTES;
             available = CAPACITY_BYTES;
@@ -180,39 +169,59 @@ final class UsbReadRing {
             System.arraycopy(m_bytes, 0, out, toEnd, n - toEnd);
         }
 
-        // The reader kept going while we copied. If it got far enough to pass
-        // the tail we started from, the head of `out` was overwritten under us
-        // and the piece is torn. Throw the whole piece away rather than hand up
-        // bytes in the wrong order, count it, and start again from the present.
-        final long headNow = m_written;
-        if (headNow - tail > CAPACITY_BYTES) {
-            m_overrun += headNow - tail;
-            m_drained = headNow;
-            return null;
-        }
-
         m_drained = tail + n;
         m_pieces++;
         return out;
     }
 
-    /** Total bytes stored by the reader since the port opened. */
-    long writtenBytes() {
+    /**
+     * Empty the buffer: head and tail both back to the start.
+     *
+     * <p>His ruling, 2026-09-12: <i>"Any time you open connection at one speed
+     * you reset head and tail (you clear the circular buffer buffer) (this is
+     * regarding: what happens to the wrong-rate bytes the library produces at
+     * 9600 inside its own open)"</i>.
+     *
+     * <p>That is the whole answer to the 9600-baud hazard. felhr's
+     * {@code openFTDI()} ends by programming the chip to 9600
+     * (FTDISerialDevice.java:474) and the adapter starts its read thread inside
+     * {@code syncOpen()}, so whatever is read before the caller's rate is
+     * applied is mis-clocked framing noise. Clearing the buffer where the speed
+     * is set throws it away, and every open starts clean.
+     *
+     * <p>It is applied on EVERY open, not only the first, because the rate probe
+     * opens the same port again and again at different rates — which is exactly
+     * the case this protects. Nothing real is ever lost by it: the caller writes
+     * its first byte to the board only after the rate has been set.
+     */
+    synchronized void reset() {
+        m_written = 0;
+        m_drained = 0;
+        m_overrun = 0;
+        m_pieces = 0;
+    }
+
+    /** Total bytes stored since the buffer was last cleared. */
+    synchronized long writtenBytes() {
         return m_written;
     }
 
-    /** Total bytes handed up since the port opened. */
-    long drainedBytes() {
+    /** Total bytes handed up since the buffer was last cleared. */
+    synchronized long drainedBytes() {
         return m_drained;
     }
 
-    /** Total bytes lost because the drain was late and the buffer filled. */
-    long overrunBytes() {
+    /**
+     * Total bytes the writer overwrote before the reader reached them, since the
+     * buffer was last cleared. For a log line only; nothing behaves differently
+     * because of it.
+     */
+    synchronized long overrunBytes() {
         return m_overrun;
     }
 
-    /** How many pieces have been handed up since the port opened. */
-    long pieces() {
+    /** How many pieces have been handed up since the buffer was last cleared. */
+    synchronized long pieces() {
         return m_pieces;
     }
 }

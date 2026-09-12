@@ -15,8 +15,11 @@
 //   P3  nothing is lost: every byte in comes out, in order, at the fastest rate
 //       the application supports, long enough to wrap the buffer more than twice
 //   P4  the pieces handed up vary in size and average far more than one packet
-//   P5  a late drain loses nothing while the buffer has room, and loses the
-//       OLDEST bytes (never the newest, never a reordering) when it does not
+//   P5  a late drain loses nothing while the buffer has room, and when it fills
+//       the buffer OVERWRITES ITSELF — the oldest bytes go, the newest survive
+//       in order — which is his ruling and what any circular buffer does
+//   P8  every open clears head and tail, so nothing read at the wrong rate
+//       survives the reset — also his ruling
 //   and it prints the measurement: reads a second, hand-offs a second, and the
 //       average piece size.
 //
@@ -43,6 +46,7 @@ public final class UsbReadRingSelfCheck {
         p3NothingIsLostAcrossMoreThanTwoWraps();
         p5LateDrainLosesNothingWhileThereIsRoom();
         p5FullBufferLosesTheOldestAndNothingElse();
+        p8EveryOpenClearsHeadAndTail();
         System.out.println("ALL CHECKS PASSED");
     }
 
@@ -214,6 +218,10 @@ public final class UsbReadRingSelfCheck {
     // -----------------------------------------------------------------------
 
     static void p5FullBufferLosesTheOldestAndNothingElse() {
+        // His ruling: "it will do whatever any circular buffer do. it will
+        // overwrite it self." So the oldest bytes go and the newest survive in
+        // order - no special case, no dropping of the newest.
+
         final UsbReadRing ring = new UsbReadRing();
         // Ten seconds of the fastest board with no drain at all — 1.68 buffers
         // more than the buffer holds.
@@ -252,6 +260,65 @@ public final class UsbReadRingSelfCheck {
                 + " bytes stored with no drain, " + expectedLost
                 + " oldest bytes counted as lost, the newest " + piece.length
                 + " came back in order");
+    }
+
+    // -----------------------------------------------------------------------
+    // P8: every open at a speed clears head and tail. His ruling, and the whole
+    // answer to the wrong-rate bytes felhr's own open produces at 9600.
+    // -----------------------------------------------------------------------
+
+    static void p8EveryOpenClearsHeadAndTail() {
+        final UsbReadRing ring = new UsbReadRing();
+        final byte[] noise = new byte[PACKET_PAYLOAD];
+        for (int i = 0; i < noise.length; i++) {
+            // The mis-framed f6 f6 f6 e6 ... the tester's phone recorded at the
+            // wrong rate.
+            noise[i] = (byte) ((i % 6 < 3) ? 0xF6 : 0xE6);
+        }
+        // Twelve reads' worth of 9600-baud noise before the rate is applied.
+        for (int i = 0; i < 12; i++) {
+            ring.write(noise, noise.length);
+        }
+        require(ring.writtenBytes() == 12L * PACKET_PAYLOAD,
+                "P8 FAILED: the reader did not store the wrong-rate bytes; it must store "
+                        + "whatever it reads and make no decisions");
+
+        // setPortParameters applies the real rate and clears head and tail.
+        ring.reset();
+        require(ring.writtenBytes() == 0 && ring.drainedBytes() == 0,
+                "P8 FAILED: reset left head at " + ring.writtenBytes() + " and tail at "
+                        + ring.drainedBytes() + "; both must be back at the start");
+        require(ring.drain() == null,
+                "P8 FAILED: a cleared buffer handed something up, so wrong-rate bytes "
+                        + "survived the reset");
+
+        // And the real stream that follows comes through untouched.
+        final byte[] real = new byte[PACKET_PAYLOAD];
+        for (int i = 0; i < real.length; i++) {
+            real[i] = streamByte(i);
+        }
+        ring.write(real, real.length);
+        final byte[] piece = ring.drain();
+        require(piece != null && piece.length == PACKET_PAYLOAD,
+                "P8 FAILED: the first real read after the reset did not come through whole");
+        for (int i = 0; i < piece.length; i++) {
+            require(piece[i] == streamByte(i),
+                    "P8 FAILED: byte " + i + " after the reset is wrong");
+        }
+
+        // A SECOND open at another rate clears it again — the probe opens the
+        // same port again and again, which is exactly the case this protects.
+        for (int i = 0; i < 12; i++) {
+            ring.write(noise, noise.length);
+        }
+        ring.reset();
+        require(ring.writtenBytes() == 0 && ring.drain() == null,
+                "P8 FAILED: the SECOND open did not clear the buffer. The reset must be "
+                        + "applied on every open, not only the first");
+        System.out.println("P8 every open clears head and tail: "
+                + (12 * PACKET_PAYLOAD) + " bytes of wrong-rate noise stored, cleared by "
+                + "the reset, nothing handed up, the real stream after it intact, and the "
+                + "same again on the next open");
     }
 
     // -----------------------------------------------------------------------

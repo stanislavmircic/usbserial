@@ -62,13 +62,19 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
     //    ENDPOINT (see bulkInPacketBytes below), not assumed.
     // 2. IT STORES THE BYTES IN A 1 MB CIRCULAR BUFFER AND DOES NOTHING ELSE —
     //    no allocation per read, no delivery, no decisions. UsbReadRing carries
-    //    the size arithmetic (five seconds at the fastest board) and the
-    //    decision about what happens when it fills.
+    //    the size arithmetic (five seconds at the fastest board) and his rulings
+    //    about what happens when it fills and when a port is opened.
     // 3. A DRAIN RUNS 20 TIMES A SECOND AND TAKES WHATEVER IS THERE. It reads
     //    the write head, copies everything between the tail and that head,
     //    advances the tail, and hands one piece up. Never a fixed size: the
     //    piece is about 8.8 KB at the fastest board and about 1 KB at the
     //    slowest, always more than one packet, and it varies with what arrived.
+    //
+    // Because the drain takes everything available rather than a fixed amount,
+    // it cannot meaningfully fall behind; if the writer does catch it anyway the
+    // buffer overwrites itself, which is what any circular buffer does. And
+    // every open at a speed clears head and tail — his ruling, and the whole
+    // answer to the wrong-rate bytes felhr's own open produces at 9600.
     //
     // The promise to Dart is the one it always had — one large, variable-size
     // piece, in order, with nothing dropped, and the tail never held back by
@@ -109,19 +115,6 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
 
     // Everything the reader stores and the drain takes.
     private final UsbReadRing m_ring = new UsbReadRing();
-
-    // False until setPortParameters has applied the real baud rate.
-    //
-    // felhr's openFTDI() ends by programming the chip to 9600 baud
-    // (FTDISerialDevice.java:474), and open() below starts the read thread
-    // straight after syncOpen(), so the first reads of every open are made at
-    // 9600 no matter what rate the caller wants. Those bytes are mis-clocked
-    // framing noise. THE READER STILL READS THEM — leaving them in the USB pipe
-    // would fill the chip's own small buffer and stall the board — but it does
-    // not store them, so they never enter the circular buffer and no part
-    // downstream has to know about them. The reader is the only writer, so
-    // there is nothing to clear afterwards either.
-    private volatile boolean m_rateSet = false;
 
     private volatile boolean m_reading = false;
     private Thread m_readThread;
@@ -203,9 +196,22 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
         m_SerialDevice.setDataBits(dataBits);
         m_SerialDevice.setStopBits(stopBits);
         m_SerialDevice.setParity(parity);
-        // From here on the line runs at the rate the caller asked for, so what
-        // the reader stores is real data.
-        m_rateSet = true;
+        // EVERY OPEN AT A SPEED CLEARS THE BUFFER. His ruling, 2026-09-12:
+        // "Any time you open connection at one speed you reset head and tail
+        // (you clear the circular buffer buffer) (this is regarding: what
+        // happens to the wrong-rate bytes the library produces at 9600 inside
+        // its own open)".
+        //
+        // This is that reset, and it is the whole answer to the 9600-baud
+        // hazard: felhr's openFTDI() ends by programming the chip to 9600
+        // (FTDISerialDevice.java:474) and open() below starts the read thread
+        // inside syncOpen(), so everything read up to this line was read at
+        // 9600 and is mis-clocked framing noise. Clearing head and tail here
+        // throws it away. It happens on EVERY open, not only the first, because
+        // the rate probe opens the same port again and again at different rates
+        // — exactly the case this protects. Nothing real is lost: the caller
+        // writes its first byte to the board only after this call returns.
+        m_ring.reset();
     }
 
     private void setFlowControl( int flowControl ) {
@@ -248,13 +254,11 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
                 if (n <= 0) {
                     continue;
                 }
-                if (!m_rateSet) {
-                    // Read at the 9600 baud felhr's open leaves behind, before
-                    // setPortParameters applied the real rate. Read so the USB
-                    // pipe stays clear, then thrown away: mis-clocked noise
-                    // never enters the circular buffer.
-                    continue;
-                }
+                // Store it, whatever it is. The reader makes no decisions: the
+                // bytes read at the 9600 baud felhr's open leaves behind are
+                // stored like any other and then cleared by the reset in
+                // setPortParameters, which is his ruling and not a judgement
+                // made here.
                 m_ring.write(packet, n);
             }
         }
@@ -294,6 +298,11 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
 
     private Boolean open() {
         if ( m_SerialDevice.syncOpen() ) {
+            // Head and tail to the start before either thread runs, so an open
+            // never begins on bytes left over from the open before it (his
+            // ruling; the matching reset is in setPortParameters, where the
+            // speed is actually applied).
+            m_ring.reset();
             m_reading = true;
             m_readThread = new Thread(m_readLoop, "usb_serial-read-" + m_InterfaceId);
             m_readThread.start();
@@ -330,7 +339,7 @@ public class UsbSerialPortAdapter implements MethodCallHandler, EventChannel.Str
         handOff();
         Log.i(TAG, "read road closed: " + m_ring.writtenBytes() + " bytes stored, "
                 + m_ring.drainedBytes() + " handed up in " + m_ring.pieces()
-                + " pieces, " + m_ring.overrunBytes() + " lost to a late drain");
+                + " pieces, " + m_ring.overrunBytes() + " overwritten");
         m_SerialDevice.syncClose();
         return true;
     }
